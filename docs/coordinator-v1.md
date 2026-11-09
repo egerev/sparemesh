@@ -2,7 +2,7 @@
 
 This draft provides a Python library and local CLI backed by one SQLite database. Every JSON record includes `schema_version` equal to `1`. Database schema version `1` is recorded with SQLite `user_version`. Unknown input fields and unsupported versions are rejected.
 
-The demo uses simulated workers. Real remote execution requires Dima's worker and transport integration. Networking and remote authentication are deferred to that adapter.
+The `demo` command uses simulated workers. The [remote pilot](remote-pilot.md) connects this contract to real local and SSH workers. Its operator-controlled configuration binds each transport to a host and worker identity.
 
 ## Responsibility boundaries
 
