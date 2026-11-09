@@ -1,0 +1,76 @@
+import json
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class CliTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.database = str(Path(self.directory.name) / "coordinator.sqlite")
+
+    def cli(self, *arguments, input=None):
+        return subprocess.run(
+            [sys.executable, "-m", "sparemesh", "--db", self.database, *arguments],
+            input=json.dumps(input) if input is not None else None,
+            capture_output=True,
+            text=True,
+            cwd=ROOT,
+            timeout=10,
+        )
+
+    def test_demo_exercises_the_simulated_lifecycle(self):
+        output = self.cli("demo")
+        self.assertEqual(output.returncode, 0, output.stderr)
+        demo = json.loads(output.stdout)
+        self.assertEqual(demo["mode"], "simulated_workers")
+        events = {check["event"] for check in demo["checks"]}
+        self.assertTrue({"local_run", "peer_alice", "peer_bob", "both_busy", "queued_cancel",
+                         "running_cancel", "restart_retains_slots", "stale_snapshot_rejected",
+                         "completion_replay", "conflicting_completion_rejected"} <= events)
+
+    def test_cli_roundtrip_across_processes(self):
+        registered = self.cli("register-host", "mac", "--owner", "alice", "--worker", "worker-mac")
+        self.assertEqual(registered.returncode, 0, registered.stderr)
+        snapshot = {
+            "schema_version": 1, "sequence": 1, "os": "darwin", "arch": "arm64",
+            "runtimes": ["python3.11"], "profiles": ["smoke-tests"],
+            "available_memory_mb": 2048, "ready": True, "allow_guests": True, "pressure": False,
+        }
+        reported = self.cli("report-host", "mac", "--worker", "worker-mac", "--snapshot", "-", input=snapshot)
+        self.assertEqual(reported.returncode, 0, reported.stderr)
+        submitted = self.cli("submit", "smoke-tests", "--job-id", "job-1", "--owner", "alice",
+                             "--ref", "a" * 40, "--os", "darwin", "--arch", "arm64",
+                             "--runtime", "python3.11", "--memory-mb", "512")
+        self.assertEqual(submitted.returncode, 0, submitted.stderr)
+        claimed = self.cli("claim", "mac", "--worker", "worker-mac")
+        self.assertEqual(claimed.returncode, 0, claimed.stderr)
+        assignment = json.loads(claimed.stdout)
+        canceled = self.cli("cancel", "job-1", "--owner", "alice")
+        self.assertEqual(json.loads(canceled.stdout)["state"], "cancel_requested")
+        finished = self.cli("finish", assignment["attempt_id"], "--host", "mac", "--worker", "worker-mac",
+                            "--result", "-", input={"schema_version": 1, "outcome": "canceled", "exit_code": None, "summary": "stopped"})
+        self.assertEqual(finished.returncode, 0, finished.stderr)
+        status = self.cli("status", "job-1")
+        self.assertEqual(json.loads(status.stdout)["state"], "canceled")
+
+    def test_domain_error_is_json_and_nonzero(self):
+        output = self.cli("status", "missing")
+        self.assertEqual(output.returncode, 2)
+        self.assertEqual(json.loads(output.stderr)["error"]["code"], "NotFoundError")
+
+    def test_invalid_json_is_reported_without_traceback(self):
+        self.cli("register-host", "mac", "--owner", "alice", "--worker", "worker-mac")
+        output = self.cli("report-host", "mac", "--worker", "worker-mac", "--snapshot", "-", input=[])
+        self.assertEqual(output.returncode, 2)
+        self.assertEqual(json.loads(output.stderr)["error"]["code"], "ValidationError")
+
+
+if __name__ == "__main__":
+    unittest.main()
