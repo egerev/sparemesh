@@ -67,6 +67,18 @@ python3 -m sparemesh bundle-source --repo /path/to/project \
 
 [Source bundle contract v1](docs/source-bundle-v1.md) defines the archive root, manifest, accepted paths, size limits, and worker verification requirements.
 
+## Utilization analytics
+
+Collect CPU, memory, swap, and guest-admission observations locally, or gather them while the pilot controller polls its workers. Daily JSON reports show observation coverage and separate the host owner's tasks from guest tasks. Task CPU and resident-memory figures are sampled estimates.
+
+```sh
+python3 -m sparemesh.worker --config /absolute/path/worker.json collect --interval 15
+python3 -m sparemesh pilot-report --config /absolute/path/pilot.json \
+  --date 2026-11-09 --timezone Asia/Makassar
+```
+
+[Analytics setup and interpretation](docs/analytics-v0.md) covers local reports, task attribution, retention, and gaps in the collected history.
+
 ## License
 
 [MIT](LICENSE).

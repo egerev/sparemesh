@@ -31,6 +31,7 @@ from .coordinator import (ConflictError, CoordinatorError, IdentityError, NotFou
                           _requirements, _version)
 from .source_bundle import (MAX_ARCHIVE_BYTES, MAX_BLOB_BYTES, MAX_ENTRIES,
                             MAX_SOURCE_BYTES, ROOT_PREFIX, SourceBundleError, _safe_path)
+from .metrics import HostSampler, ProcessGroupUsage
 
 
 MAX_HEADER_BYTES = 64 * 1024
@@ -239,8 +240,16 @@ class Worker:
         info = self.config_path.stat()
         if info.st_uid != os.getuid() or info.st_mode & 0o022:
             raise WorkerError("worker config must be owned by this user and not writable by others")
-        self.config = dict(_object(_read_json(self.config_path), {"schema_version", "host_id", "worker_id",
+        config = _read_json(self.config_path)
+        if isinstance(config, dict) and "owner" in config:
+            _identifier(config["owner"], "owner")
+            owner = config["owner"]
+            config = {key: value for key, value in config.items() if key != "owner"}
+        else:
+            owner = None
+        self.config = dict(_object(config, {"schema_version", "host_id", "worker_id",
                                  "state_dir", "profiles", "reserve_memory_mb", "allow_guests"}, "worker config"))
+        self.config["owner"] = owner
         _version(self.config["schema_version"])
         for key in ("host_id", "worker_id"):
             _identifier(self.config[key], key)
@@ -269,6 +278,7 @@ class Worker:
             _number(profile["timeout_seconds"], "timeout_seconds", positive=True)
         self.attempts = self.root / "attempts"
         self.attempts.mkdir(mode=0o700, exist_ok=True)
+        self.sampler = HostSampler(self.root / "metrics.json")
         with self._lock():
             path = self.root / "identity.json"
             identity = {key: self.config[key] for key in ("host_id", "worker_id")}
@@ -355,7 +365,7 @@ class Worker:
             raise WorkerError("cannot measure available memory") from error
         return max(0.0, available / 1_000_000 - self.config["reserve_memory_mb"])
 
-    def probe(self):
+    def probe(self, *, sample_interval=15):
         profiles = self._runtime_profiles()
         error = None
         try:
@@ -369,6 +379,10 @@ class Worker:
                 raise WorkerError("snapshot sequence exhausted")
             _atomic_json(sequence_path, sequence)
             unresolved = self._unresolved()
+            states = [self._load(attempt_id) for attempt_id in unresolved]
+            if not states:
+                states = [self._load(path.name) for path in self.attempts.iterdir() if path.is_dir()]
+            latest = max(states, key=lambda state: state["identity"]["assigned_at"], default=None)
         response = {"schema_version": 1, "host_id": self.config["host_id"], "worker_id": self.config["worker_id"],
                     "snapshot": {"schema_version": 1, "sequence": sequence, "os": platform.system().lower(),
                                  "arch": platform.machine(), "runtimes": sorted({p["runtime"] for p in profiles.values()}),
@@ -378,11 +392,78 @@ class Worker:
                     "unresolved_attempt_ids": unresolved}
         if error:
             response["probe_error"] = error
+        analytics = {"sample": None, "attempt": self._attempt_analytics(latest) if latest else None,
+                     "diagnostics": []}
+        try:
+            eligible = response["snapshot"]["ready"] and self.config["allow_guests"]
+            sample, diagnostics = self.sampler.sample(
+                self.config["host_id"], guest_eligible=None if error else eligible,
+                active_attempt_id=unresolved[0] if unresolved else None, min_interval=sample_interval)
+            analytics["sample"] = sample
+            analytics["diagnostics"].extend(diagnostics)
+        except Exception as failure:
+            analytics["diagnostics"].append(f"host sampling unavailable ({type(failure).__name__})")
+        response["analytics"] = analytics
+        self._persist_analytics(analytics)
         return response
+
+    def _attempt_analytics(self, state):
+        identity = state["identity"]
+        usage = state.get("usage", {})
+        return {"schema_version": 1, "attempt_id": state["attempt_id"],
+                "job_id": identity["job"]["job_id"], "host_id": identity["host_id"],
+                "job_owner": identity["job"]["owner"], "host_owner": self.config["owner"],
+                "assigned_at": identity["assigned_at"], "started_at": usage.get("started_at"),
+                "finished_at": usage.get("finished_at"), "state": state["state"],
+                "cpu_seconds": usage.get("cpu_seconds"), "peak_rss_mb": usage.get("peak_rss_mb"),
+                "usage_sample_count": usage.get("usage_sample_count", 0)}
+
+    def _persist_analytics(self, analytics):
+        try:
+            from .analytics import AnalyticsStore
+            with AnalyticsStore(self.root / "analytics.sqlite3", sqlite_timeout=0.05) as store:
+                if analytics.get("sample") is not None:
+                    store.record_sample(analytics["sample"])
+                if analytics.get("attempt") is not None:
+                    store.record_attempt(analytics["attempt"])
+        except Exception as failure:
+            analytics.setdefault("diagnostics", []).append(
+                f"local analytics storage unavailable ({type(failure).__name__})")
+
+    def _persist_response(self, response):
+        self._persist_analytics(response["analytics"])
+        return response
+
+    def _update_usage(self, state, sampler, *, final=False):
+        if sampler is None:
+            return
+        try:
+            state["usage"].update(sampler.stop() if final else sampler.snapshot())
+            if sampler.diagnostics:
+                state["analytics_diagnostics"] = list(sampler.diagnostics)
+        except Exception as failure:
+            state.setdefault("analytics_diagnostics", []).append(
+                f"process usage unavailable ({type(failure).__name__})")
+
+    def _flush_usage(self, attempt_id, sampler):
+        if sampler is None:
+            return
+        try:
+            with self._lock():
+                state = self._load(attempt_id)
+                self._update_usage(state, sampler)
+                self._save(state)
+        except Exception as failure:
+            if sampler is not None and not sampler.diagnostics:
+                sampler.diagnostics.append(f"usage checkpoint unavailable ({type(failure).__name__})")
 
     def _response(self, state):
         response = {key: state[key] for key in ("attempt_id", "state", "result")}
         response["schema_version"] = 1
+        if "usage" in state:
+            response["usage"] = dict(state["usage"])
+        response["analytics"] = {"sample": None, "attempt": self._attempt_analytics(state),
+                                 "diagnostics": list(state.get("analytics_diagnostics", []))}
         for name in ("stdout", "stderr"):
             path = self._path(state["attempt_id"]) / (name + ".log")
             try:
@@ -399,7 +480,8 @@ class Worker:
 
     def status(self, attempt_id):
         with self._lock():
-            return self._response(self._reconcile(self._load(attempt_id)))
+            response = self._response(self._reconcile(self._load(attempt_id)))
+        return self._persist_response(response)
 
     def cancel(self, attempt_id):
         with self._lock():
@@ -407,9 +489,13 @@ class Worker:
             if state["state"] == "running":
                 state["cancel_requested"] = True
                 self._save(state)
-            return self._response(state)
+            response = self._response(state)
+        return self._persist_response(response)
 
     def start(self, assignment, manifest, stream):
+        return self._persist_response(self._start(assignment, manifest, stream))
+
+    def _start(self, assignment, manifest, stream):
         identity, canceled = _assignment(assignment, self.config)
         manifest = _manifest(manifest, identity["job"]["revision"])
         attempt_id = identity["attempt_id"]
@@ -443,7 +529,9 @@ class Worker:
                 path.mkdir(mode=0o700)
                 state = {"attempt_id": attempt_id, "identity": identity, "manifest": manifest,
                          "profile": profile, "state": "running", "result": None,
-                         "cancel_requested": canceled, "phase": "receiving"}
+                         "cancel_requested": canceled, "phase": "receiving",
+                         "usage": {"started_at": None, "finished_at": None, "cpu_seconds": None,
+                                   "peak_rss_mb": None, "usage_sample_count": 0}}
                 self._save(state)
                 if canceled:
                     self._terminal(state, "canceled", None, "Canceled before execution")
@@ -497,7 +585,10 @@ class Worker:
                     lease.close()
                 slot.close()
 
-    def _terminal(self, state, outcome, exit_code, summary):
+    def _terminal(self, state, outcome, exit_code, summary, *, finished_at=None):
+        state.setdefault("usage", {"started_at": None, "cpu_seconds": None,
+                                   "peak_rss_mb": None, "usage_sample_count": 0})["finished_at"] = (
+                                       time.time() if finished_at is None else finished_at)
         state.update(state=outcome, phase="complete",
                      result={"schema_version": 1, "outcome": outcome, "exit_code": exit_code,
                              "summary": summary[:4096]})
@@ -559,12 +650,14 @@ def _supervise(worker, attempt_id, slot_fd, lease_fd):
     _subreaper()
     path = worker._path(attempt_id)
     process = None
+    usage = None
     buffers = {"stdout": bytearray(), "stderr": bytearray()}
     selector = selectors.DefaultSelector()
     reason = None
     group = None
     termination_at = None
     last_flush = 0.0
+    last_usage_flush = 0.0
     try:
         with worker._lock():
             state = worker._load(attempt_id)
@@ -581,7 +674,16 @@ def _supervise(worker, attempt_id, slot_fd, lease_fd):
                                        start_new_session=True, close_fds=True)
             group = process.pid
             state.update(phase="executing", process_group=group)
+            state.setdefault("usage", {"finished_at": None, "cpu_seconds": None,
+                                       "peak_rss_mb": None, "usage_sample_count": 0})["started_at"] = time.time()
+            try:
+                usage = ProcessGroupUsage(group)
+                usage.start()
+            except Exception as failure:
+                state.setdefault("analytics_diagnostics", []).append(
+                    f"process usage unavailable ({type(failure).__name__})")
             worker._save(state)
+        worker._persist_analytics({"attempt": worker._attempt_analytics(state), "diagnostics": []})
         for name in buffers:
             stream = getattr(process, name)
             os.set_blocking(stream.fileno(), False)
@@ -624,8 +726,12 @@ def _supervise(worker, attempt_id, slot_fd, lease_fd):
             if now - last_flush >= 0.25:
                 for name, data in buffers.items():
                     (path / (name + ".log")).write_bytes(data)
+                if now - last_usage_flush >= 1:
+                    worker._flush_usage(attempt_id, usage)
+                    last_usage_flush = now
                 last_flush = now
             if returncode is not None and not _group_exists(group) and not selector.get_map():
+                finished_at = time.time()
                 break
             if termination_at is not None and now - termination_at > 6:
                 raise WorkerError("process group cleanup could not be confirmed")
@@ -634,15 +740,25 @@ def _supervise(worker, attempt_id, slot_fd, lease_fd):
                 stream.write(data)
                 stream.flush()
                 os.fsync(stream.fileno())
+        # Join the bounded sampler before publishing the terminal observation.
+        worker._update_usage(state, usage, final=True)
+        measurements = state.get("usage")
         with worker._lock():
             state = worker._load(attempt_id)
+            if measurements is not None:
+                state["usage"] = measurements
+            worker._update_usage(state, usage)
             if reason == "canceled":
-                worker._terminal(state, "canceled", returncode, "Canceled and confirmed process group exited")
+                worker._terminal(state, "canceled", returncode, "Canceled and confirmed process group exited",
+                                 finished_at=finished_at)
             elif reason == "timeout":
-                worker._terminal(state, "failed", returncode or None, "Profile timed out and process group exited")
+                worker._terminal(state, "failed", returncode or None, "Profile timed out and process group exited",
+                                 finished_at=finished_at)
             else:
                 outcome = "succeeded" if returncode == 0 else "failed"
-                worker._terminal(state, outcome, returncode, f"Profile exited with code {returncode}; process group exited")
+                worker._terminal(state, outcome, returncode, f"Profile exited with code {returncode}; process group exited",
+                                 finished_at=finished_at)
+        worker._persist_analytics({"attempt": worker._attempt_analytics(state), "diagnostics": []})
     except BaseException as error:
         cleaned = False
         if process is not None:
@@ -650,8 +766,13 @@ def _supervise(worker, attempt_id, slot_fd, lease_fd):
                 cleaned = _stop_group(process)
             except OSError:
                 pass
+        if usage is not None:
+            worker._update_usage(state, usage, final=True)
         with worker._lock():
+            measurements = state.get("usage")
             state = worker._load(attempt_id)
+            if measurements is not None:
+                state["usage"] = measurements
             if process is None:
                 worker._terminal(state, "failed", None, f"Profile launch failed: {error}")
             elif cleaned:
@@ -660,6 +781,7 @@ def _supervise(worker, attempt_id, slot_fd, lease_fd):
             else:
                 state.update(state="uncertain", detail=f"Supervisor failure: {error}")
                 worker._save(state)
+        worker._persist_analytics({"attempt": worker._attempt_analytics(state), "diagnostics": []})
     finally:
         if process is not None:
             for name in ("stdout", "stderr"):
@@ -674,8 +796,12 @@ def _supervise(worker, attempt_id, slot_fd, lease_fd):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
-    parser.add_argument("command", choices=("rpc", "_supervise"))
+    parser.add_argument("command", choices=("rpc", "collect", "report", "_supervise"))
     parser.add_argument("internal", nargs="*")
+    parser.add_argument("--interval", type=float, default=15)
+    parser.add_argument("--max-samples", type=int)
+    parser.add_argument("--date")
+    parser.add_argument("--timezone", default="UTC")
     args = parser.parse_args(argv)
     try:
         worker = Worker(args.config)
@@ -683,6 +809,29 @@ def main(argv=None):
             if len(args.internal) != 3:
                 raise ValidationError("invalid internal supervisor arguments")
             _supervise(worker, args.internal[0], int(args.internal[1]), int(args.internal[2]))
+            return 0
+        if args.internal:
+            raise ValidationError("unexpected worker command arguments")
+        if args.command == "collect":
+            _number(args.interval, "interval", positive=True)
+            if args.max_samples is not None and args.max_samples < 1:
+                raise ValidationError("max_samples must be positive")
+            count = 0
+            while args.max_samples is None or count < args.max_samples:
+                started = time.monotonic()
+                print(json.dumps(worker.probe(sample_interval=args.interval)["analytics"],
+                                 sort_keys=True, allow_nan=False), flush=True)
+                count += 1
+                if args.max_samples is None or count < args.max_samples:
+                    time.sleep(max(0, args.interval - (time.monotonic() - started)))
+            return 0
+        if args.command == "report":
+            from .analytics import AnalyticsStore
+            if args.date is None:
+                raise ValidationError("report requires --date YYYY-MM-DD")
+            with AnalyticsStore(worker.root / "analytics.sqlite3") as store:
+                response = store.report(date=args.date, timezone=args.timezone, host_id=worker.config["host_id"])
+            print(json.dumps(response, sort_keys=True, allow_nan=False), flush=True)
             return 0
         header = sys.stdin.buffer.readline(MAX_HEADER_BYTES + 1)
         if len(header) > MAX_HEADER_BYTES or not header.endswith(b"\n"):
@@ -706,6 +855,8 @@ def main(argv=None):
         return 0
     except BrokenPipeError:
         return 1
+    except KeyboardInterrupt:
+        return 0
     except (CoordinatorError, OSError, ValueError, TypeError) as error:
         print(json.dumps({"error": {"code": type(error).__name__, "message": str(error)}}), flush=True)
         return 2

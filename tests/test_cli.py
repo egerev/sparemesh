@@ -1,10 +1,14 @@
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+
+from sparemesh.analytics import AnalyticsStore
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -104,6 +108,47 @@ class CliTests(unittest.TestCase):
         self.assertEqual(error["code"], "SourceBundleError")
         self.assertIn("full", error["message"])
         self.assertFalse(Path(self.database).exists())
+
+    def test_pilot_report_reads_daily_analytics_without_contacting_workers(self):
+        directory = Path(self.directory.name)
+        assigned_at = time.time() - 60
+        date = datetime.fromtimestamp(assigned_at, timezone.utc).date().isoformat()
+        config = directory / "pilot.json"
+        config.write_text(json.dumps({
+            "schema_version": 1, "database": "controller.sqlite3", "artifacts_dir": "bundles",
+            "hosts": [{"host_id": "mac", "owner": "alice", "worker_id": "worker-mac", "transport": {
+                "kind": "local", "python": "/missing-python", "package_dir": "source", "worker_config": "worker.json",
+            }}],
+        }))
+        with AnalyticsStore(directory / "controller.analytics.sqlite3") as analytics:
+            analytics.record_attempt({
+                "schema_version": 1, "attempt_id": "attempt-one", "job_id": "job-one", "host_id": "mac",
+                "job_owner": "alice", "host_owner": "alice", "assigned_at": assigned_at,
+                "started_at": assigned_at + 10, "finished_at": assigned_at + 20, "state": "succeeded",
+                "cpu_seconds": 2.5, "peak_rss_mb": 30, "usage_sample_count": 2,
+            })
+        output = self.cli("pilot-report", "--config", str(config), "--date", date, "--timezone", "UTC", "--host", "mac")
+        self.assertEqual(output.returncode, 0, output.stderr)
+        report = json.loads(output.stdout)
+        self.assertEqual(report["date"], date)
+        self.assertEqual(report["timezone"], "UTC")
+        self.assertEqual(report["hosts"][0]["host_id"], "mac")
+        self.assertEqual(report["hosts"][0]["workload"]["own"]["completed_count"], 1)
+        self.assertFalse((directory / "controller.sqlite3").exists())
+        self.assertFalse((directory / "bundles").exists())
+
+    def test_pilot_report_invalid_date_is_json_error(self):
+        directory = Path(self.directory.name)
+        config = directory / "pilot.json"
+        config.write_text(json.dumps({
+            "schema_version": 1, "database": "controller.sqlite3", "artifacts_dir": "bundles",
+            "hosts": [{"host_id": "mac", "owner": "alice", "worker_id": "worker-mac", "transport": {
+                "kind": "local", "python": "/python", "package_dir": "source", "worker_config": "worker.json",
+            }}],
+        }))
+        output = self.cli("pilot-report", "--config", str(config), "--date", "not-a-date", "--timezone", "UTC")
+        self.assertEqual(output.returncode, 2)
+        self.assertEqual(json.loads(output.stderr)["error"]["code"], "ValidationError")
 
 
 if __name__ == "__main__":
