@@ -13,7 +13,7 @@ Each participant has a personal job queue. One coordinator stores and schedules 
 
 ## First pilot
 
-Run one agreed test profile on two Apple Silicon Macs. A worker on each Mac reports readiness and pulls jobs from the coordinator over Tailscale. Each profile specifies a repository, a fixed test command, and a timeout. Each run uses a specific commit in a dedicated working directory under a restricted account.
+Run one agreed test profile on two Apple Silicon Macs. The controller polls a worker on each Mac over SSH and Tailscale, collects readiness, and delivers assigned jobs. Each worker profile specifies a fixed Python command, its runtime, and a timeout. Each job supplies a verified source bundle for a full commit. Each run uses a specific commit in a dedicated working directory under the configured account.
 
 The proposed CLI looks like this:
 
@@ -44,13 +44,17 @@ python3 -m sparemesh demo
 python3 -m sparemesh --help
 ```
 
-The demo exercises automatic local and peer routing, waiting while both hosts are busy, cancellation, coordinator restart, and repeated or conflicting worker reports. It uses a temporary database and simulated completions. Remote execution requires the worker and transport integration.
+The demo exercises automatic local and peer routing, waiting while both hosts are busy, cancellation, coordinator restart, and repeated or conflicting worker reports. It uses a temporary database and simulated completions. The remote pilot adds worker execution and SSH transport to the same coordinator.
 
 The CLI stores persistent state in `sparemesh.sqlite3` by default. Use `--db /path/to/state.sqlite3` before the subcommand to select another local database. It assumes a trusted local operator with access to that file. Remote authentication belongs in the transport adapter.
 
 [Coordinator and worker contract](docs/coordinator-v1.md) describes the Python API, JSON formats, state transitions, ownership checks, and runnable CLI examples. Execution, process cleanup, SSH transport, logs, and fixed profile definitions belong to the worker integration.
 
-**Status:** coordinator prototype ready for worker integration and two-Mac testing.
+## Remote pilot
+
+The CLI can now prepare source, assign jobs to compatible Macs, transfer the source bundle, and run a worker-owned profile. Workers retain attempt identity and logs across controller reconnects. A repeated start returns the existing attempt. Confirmed terminal results release the coordinator slot.
+
+[Two-Mac setup and commands](docs/remote-pilot.md) covers worker profiles, the controller configuration, submission, logs, peer routing, and cancellation. The pilot uses trusted source under the configured OS account. Process-group supervision and memory admission do not provide a sandbox or hard resource quotas.
 
 ## Fixed-commit source bundles
 

@@ -5,10 +5,13 @@ import json
 from pathlib import Path
 import sqlite3
 import sys
+import time
 
 from . import Coordinator, CoordinatorError, ValidationError
 from .demo import run_demo
 from .source_bundle import SourceBundleError, package_source
+from .pilot import Pilot, load_config
+from .transport import TransportError
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -71,6 +74,29 @@ def _parser() -> argparse.ArgumentParser:
     bundle.add_argument("--repo", required=True, help="local Git repository path")
     bundle.add_argument("--commit", required=True, help="full commit object ID, not a branch or tag")
     bundle.add_argument("--output", required=True, help="new bundle directory under an existing parent")
+
+    pilot_submit = commands.add_parser("pilot-submit", help="package a commit and enqueue it for real workers")
+    pilot_submit.add_argument("--config", required=True, help="pilot JSON configuration")
+    pilot_submit.add_argument("--repo", required=True, help="local Git repository path")
+    pilot_submit.add_argument("--ref", required=True, dest="revision", help="full commit object ID")
+    pilot_submit.add_argument("--profile", required=True)
+    pilot_submit.add_argument("--job-id", required=True)
+    pilot_submit.add_argument("--owner", required=True)
+    pilot_submit.add_argument("--os", required=True)
+    pilot_submit.add_argument("--arch", required=True)
+    pilot_submit.add_argument("--runtime", required=True)
+    pilot_submit.add_argument("--memory-mb", required=True, type=float)
+    pilot_submit.add_argument("--restartable", action="store_true")
+
+    for command, help_text in (("pilot-tick", "probe, dispatch, and reconcile every configured worker once"),
+                               ("pilot-run", "run the worker controller until interrupted"),
+                               ("pilot-result", "read a job result and its worker log tails")):
+        pilot_command = commands.add_parser(command, help=help_text)
+        pilot_command.add_argument("--config", required=True, help="pilot JSON configuration")
+        if command == "pilot-run":
+            pilot_command.add_argument("--max-ticks", type=int, help="stop after this many ticks")
+        elif command == "pilot-result":
+            pilot_command.add_argument("--job-id", required=True)
     return parser
 
 
@@ -120,12 +146,37 @@ def main(argv: list[str] | None = None) -> int:
             value = run_demo()
         elif args.command == "bundle-source":
             value = package_source(args.repo, args.commit, args.output)
+        elif args.command.startswith("pilot-"):
+            with Pilot(load_config(args.config)) as pilot:
+                if args.command == "pilot-submit":
+                    value = pilot.submit(
+                        args.repo, args.revision, args.job_id, args.owner, args.profile,
+                        {"os": args.os, "arch": args.arch, "runtime": args.runtime, "memory_mb": args.memory_mb},
+                        args.restartable,
+                    )
+                elif args.command == "pilot-tick":
+                    value = pilot.tick()
+                elif args.command == "pilot-result":
+                    value = pilot.result(args.job_id)
+                else:
+                    if args.max_ticks is not None and args.max_ticks < 1:
+                        raise ValidationError("max-ticks must be positive")
+                    ticks = 0
+                    while True:
+                        print(json.dumps(pilot.tick(), sort_keys=True, allow_nan=False), flush=True)
+                        ticks += 1
+                        if args.max_ticks is not None and ticks >= args.max_ticks:
+                            return 0
+                        time.sleep(pilot.config.poll_seconds)
         else:
             with Coordinator(args.db) as coordinator:
                 value = _dispatch(coordinator, args)
         print(json.dumps(value, indent=2, sort_keys=True, allow_nan=False))
         return 0
-    except (CoordinatorError, SourceBundleError, sqlite3.Error) as error:
+    except KeyboardInterrupt:
+        print(json.dumps({"stopped": "controller_interrupt"}), file=sys.stderr)
+        return 130
+    except (CoordinatorError, SourceBundleError, TransportError, sqlite3.Error, OSError) as error:
         print(json.dumps({"error": {"code": type(error).__name__, "message": str(error)}}), file=sys.stderr)
         return 2
 
