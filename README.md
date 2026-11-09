@@ -34,7 +34,23 @@ The pilot is for known participants and agreed repositories. Tailscale connects 
 - Implement the coordinator, CLI, and macOS worker, then run the two-Mac demo.
 - Add a Linux worker and evaluate Slurm for Linux execution. Expose the same job API to agents through MCP.
 
-**Status:** design and pilot planning.
+## Coordinator draft
+
+The first prototype includes a durable SQLite coordinator, a local JSON CLI, and a simulated-worker demo. Python 3.11 or newer is required. Run these commands from this checkout.
+
+```sh
+python3 -m unittest discover -s tests -v
+python3 -m sparemesh demo
+python3 -m sparemesh --help
+```
+
+The demo exercises automatic local and peer routing, waiting while both hosts are busy, cancellation, coordinator restart, and repeated or conflicting worker reports. It uses a temporary database and simulated completions. Remote execution requires the worker and transport integration.
+
+The CLI stores persistent state in `sparemesh.sqlite3` by default. Use `--db /path/to/state.sqlite3` before the subcommand to select another local database. It assumes a trusted local operator with access to that file. Remote authentication belongs in the transport adapter.
+
+[Coordinator and worker contract](docs/coordinator-v1.md) describes the Python API, JSON formats, state transitions, ownership checks, and runnable CLI examples. Execution, process cleanup, SSH transport, logs, and fixed profile definitions belong to the worker integration.
+
+**Status:** coordinator prototype ready for worker integration and two-Mac testing.
 
 ## License
 
