@@ -79,6 +79,7 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(first, repeated)
         self.coordinator.close()
         self.coordinator = Coordinator(self.path, clock=self.clock)
+        self.addCleanup(self.coordinator.close)
         self.assertEqual(self.coordinator.status("job-1"), first)
 
     def test_submission_rejects_changed_immutable_payload(self):
@@ -128,6 +129,7 @@ class CoordinatorTests(unittest.TestCase):
         first = self.coordinator.claim("alice-mac", worker)
         self.coordinator.close()
         self.coordinator = Coordinator(self.path, clock=self.clock)
+        self.addCleanup(self.coordinator.close)
         self.assertEqual(self.coordinator.claim("alice-mac", worker), first)
 
     def test_concurrent_hosts_cannot_claim_the_same_job(self):

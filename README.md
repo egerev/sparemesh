@@ -52,6 +52,17 @@ The CLI stores persistent state in `sparemesh.sqlite3` by default. Use `--db /pa
 
 **Status:** coordinator prototype ready for worker integration and two-Mac testing.
 
+## Fixed-commit source bundles
+
+Package a local repository's committed source for the worker with the `bundle-source` command. It creates a deterministic `source.tar` and a SHA-256 manifest in a new output directory. Python 3.11 or newer and Git are required.
+
+```sh
+python3 -m sparemesh bundle-source --repo /path/to/project \
+  --commit <full-commit-sha> --output /path/to/bundles/run-001
+```
+
+[Source bundle contract v1](docs/source-bundle-v1.md) defines the archive root, manifest, accepted paths, size limits, and worker verification requirements.
+
 ## License
 
 [MIT](LICENSE).

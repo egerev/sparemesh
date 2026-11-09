@@ -8,6 +8,7 @@ import sys
 
 from . import Coordinator, CoordinatorError, ValidationError
 from .demo import run_demo
+from .source_bundle import SourceBundleError, package_source
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -65,6 +66,11 @@ def _parser() -> argparse.ArgumentParser:
     finish.add_argument("--result", required=True, help="JSON file, or - for stdin")
 
     commands.add_parser("demo", help="run simulated workers in an isolated temporary database")
+
+    bundle = commands.add_parser("bundle-source", help="package one exact Git commit for a worker")
+    bundle.add_argument("--repo", required=True, help="local Git repository path")
+    bundle.add_argument("--commit", required=True, help="full commit object ID, not a branch or tag")
+    bundle.add_argument("--output", required=True, help="new bundle directory under an existing parent")
     return parser
 
 
@@ -112,12 +118,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "demo":
             value = run_demo()
+        elif args.command == "bundle-source":
+            value = package_source(args.repo, args.commit, args.output)
         else:
             with Coordinator(args.db) as coordinator:
                 value = _dispatch(coordinator, args)
         print(json.dumps(value, indent=2, sort_keys=True, allow_nan=False))
         return 0
-    except (CoordinatorError, sqlite3.Error) as error:
+    except (CoordinatorError, SourceBundleError, sqlite3.Error) as error:
         print(json.dumps({"error": {"code": type(error).__name__, "message": str(error)}}), file=sys.stderr)
         return 2
 
