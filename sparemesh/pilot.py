@@ -9,6 +9,7 @@ import re
 import stat
 from typing import Any
 
+from .analytics import AnalyticsStore
 from .coordinator import Coordinator, CoordinatorError, ValidationError, _identifier, _number
 from .source_bundle import MAX_ARCHIVE_BYTES, SourceBundleError, package_source
 from .transport import RemoteError, TransportConfig, TransportError, WorkerTransport, parse_transport
@@ -30,6 +31,11 @@ class PilotConfig:
     timeout_seconds: float = 30
     poll_seconds: float = 2
     freshness_seconds: float = 30
+    analytics_database: Path | None = None
+
+    @property
+    def analytics_path(self) -> Path:
+        return self.analytics_database or self.database.with_name(self.database.stem + ".analytics.sqlite3")
 
 
 def _positive(value: Any, name: str) -> float:
@@ -50,9 +56,9 @@ def load_config(filename: str | Path) -> PilotConfig:
     except (OSError, ValueError, UnicodeError) as error:
         raise ValidationError(f"cannot read pilot config: {error}") from error
     required = {"schema_version", "database", "artifacts_dir", "hosts"}
-    optional = {"timeout_seconds", "poll_seconds", "freshness_seconds"}
+    optional = {"timeout_seconds", "poll_seconds", "freshness_seconds", "analytics_database"}
     if not isinstance(value, dict) or not required <= value.keys() or value.keys() - required - optional:
-        raise ValidationError("pilot config requires schema_version, database, artifacts_dir, hosts and supported timing options")
+        raise ValidationError("pilot config requires schema_version, database, artifacts_dir, hosts and supported optional settings")
     if type(value["schema_version"]) is not int or value["schema_version"] != 1:
         raise ValidationError("pilot config schema_version must be the integer 1")
     if not isinstance(value["hosts"], list) or not value["hosts"]:
@@ -73,6 +79,8 @@ def load_config(filename: str | Path) -> PilotConfig:
         timeout_seconds=_positive(value.get("timeout_seconds", 30), "timeout_seconds"),
         poll_seconds=_positive(value.get("poll_seconds", 2), "poll_seconds"),
         freshness_seconds=_positive(value.get("freshness_seconds", 30), "freshness_seconds"),
+        analytics_database=_path(value["analytics_database"], path.parent, "analytics_database")
+        if "analytics_database" in value else None,
     )
 
 
@@ -120,9 +128,21 @@ class Pilot:
         config.artifacts_dir.mkdir(parents=True, exist_ok=True)
         self.coordinator = Coordinator(config.database, freshness_seconds=config.freshness_seconds)
         self.transports = {host.host_id: transport_factory(host.transport, config.timeout_seconds) for host in config.hosts}
+        self.analytics = None
+        self.analytics_error = None
+        try:
+            self.analytics = AnalyticsStore(config.analytics_path, sqlite_timeout=0.1)
+        except Exception as error:
+            # Telemetry storage must not prevent worker execution or reconciliation.
+            self.analytics_error = _error(error)
 
     def close(self) -> None:
         self.coordinator.close()
+        if self.analytics is not None:
+            try:
+                self.analytics.close()
+            except Exception as error:
+                self.analytics_error = _error(error)
 
     def __enter__(self):
         return self
@@ -142,7 +162,69 @@ class Pilot:
             _bundle(destination, revision)
         return self.coordinator.submit(job_id, owner, profile, revision, requirements, restartable)
 
-    def _attempt_response(self, host: HostConfig, assignment: dict, response: dict) -> dict:
+    def _record_analytics(self, operation: str, value: dict, report: dict) -> None:
+        if self.analytics is None:
+            return
+        try:
+            getattr(self.analytics, operation)(value)
+        except Exception as error:
+            report.setdefault("analytics_errors", []).append(_error(error))
+
+    def _record_attempt(self, host: HostConfig, assignment: dict, report: dict,
+                        *, state: str | None = None, usage: dict | None = None) -> None:
+        value = {
+            "schema_version": 1, "attempt_id": assignment["attempt_id"],
+            "job_id": assignment["job"]["job_id"], "host_id": host.host_id,
+            "job_owner": assignment["job"]["owner"], "host_owner": host.owner,
+            "assigned_at": assignment["assigned_at"], "state": state or assignment["state"],
+            "started_at": None, "finished_at": None,
+            "cpu_seconds": None, "peak_rss_mb": None, "usage_sample_count": 0,
+        }
+        self._record_analytics("record_attempt", value, report)
+        if usage is not None:
+            if not isinstance(usage, dict):
+                report.setdefault("analytics_errors", []).append(_error(ValidationError("worker usage must be an object")))
+                return
+            for key in ("started_at", "finished_at", "cpu_seconds", "peak_rss_mb", "usage_sample_count"):
+                if key in usage and usage[key] is not None:
+                    value[key] = usage[key]
+            self._record_analytics("record_attempt", value, report)
+
+    def _record_worker_analytics(self, host: HostConfig, response: dict, report: dict) -> None:
+        analytics = response.get("analytics")
+        if analytics is None:
+            return
+        try:
+            if not isinstance(analytics, dict):
+                raise ValidationError("worker analytics must be an object")
+            diagnostics = analytics.get("diagnostics", [])
+            if not isinstance(diagnostics, list) or any(not isinstance(item, str) for item in diagnostics):
+                raise ValidationError("worker analytics diagnostics must be an array of strings")
+            if diagnostics:
+                messages = report.get("analytics_diagnostics", []) + [message[:1024] for message in diagnostics[:20]]
+                report["analytics_diagnostics"] = list(dict.fromkeys(messages))[:20]
+            sample = analytics.get("sample")
+            if sample is not None:
+                if not isinstance(sample, dict) or sample.get("host_id") != host.host_id:
+                    raise ValidationError("worker analytics sample does not match configured host")
+                self._record_analytics("record_sample", sample, report)
+            attempt = analytics.get("attempt")
+            if attempt is not None:
+                if not isinstance(attempt, dict):
+                    raise ValidationError("worker analytics attempt must be an object")
+                assignment = self.coordinator.status(attempt.get("job_id"))["attempt"]
+                if (assignment is None or assignment["attempt_id"] != attempt.get("attempt_id")
+                        or assignment["host_id"] != host.host_id or assignment["worker_id"] != host.worker_id):
+                    raise ValidationError("worker analytics attempt does not match its assignment")
+                state = attempt.get("state")
+                if not isinstance(state, str) or state not in {
+                        "assigned", "running", "uncertain", "cancel_requested", "succeeded", "failed", "canceled"}:
+                    raise ValidationError("worker analytics attempt has an invalid state")
+                self._record_attempt(host, assignment, report, state=state, usage=attempt)
+        except Exception as error:
+            report.setdefault("analytics_errors", []).append(_error(error))
+
+    def _attempt_response(self, host: HostConfig, assignment: dict, response: dict, report: dict) -> dict:
         if response.get("schema_version") != 1 or type(response.get("schema_version")) is not int:
             raise TransportError("worker attempt response has an unsupported schema_version")
         if response.get("attempt_id") != assignment["attempt_id"]:
@@ -157,12 +239,14 @@ class Pilot:
         if state in {"succeeded", "failed", "canceled"}:
             if not isinstance(result, dict) or result.get("outcome") != state:
                 raise TransportError("worker terminal state does not match its result")
-            self.coordinator.finish(host.host_id, host.worker_id, assignment["attempt_id"], result)
+            assignment = self.coordinator.finish(host.host_id, host.worker_id, assignment["attempt_id"], result)["attempt"]
         elif result is not None:
             raise TransportError("worker reported a terminal result for a nonterminal attempt")
+        self._record_attempt(host, assignment, report, state=state, usage=response.get("usage"))
+        self._record_worker_analytics(host, response, report)
         return response
 
-    def _dispatch(self, host: HostConfig, assignment: dict) -> dict:
+    def _dispatch(self, host: HostConfig, assignment: dict, report: dict) -> dict:
         transport = self.transports[host.host_id]
         operation = "cancel" if assignment["cancel_requested"] else "status"
         try:
@@ -173,7 +257,7 @@ class Pilot:
             manifest, archive = _bundle(self.config.artifacts_dir / assignment["job"]["revision"],
                                         assignment["job"]["revision"])
             response = transport.request({"op": "start", "assignment": assignment, "manifest": manifest}, archive)
-        return self._attempt_response(host, assignment, response)
+        return self._attempt_response(host, assignment, response, report)
 
     def tick(self) -> dict:
         events = []
@@ -192,6 +276,7 @@ class Pilot:
                     raise TransportError("worker probe identity does not match configured host")
                 self.coordinator.report_host(host.host_id, host.worker_id, probe.get("snapshot"))
                 event["probe"] = "ok"
+                self._record_worker_analytics(host, probe, event)
                 ready.append((host, event))
             except (TransportError, CoordinatorError, SourceBundleError, OSError) as error:
                 event["error"] = _error(error)
@@ -202,15 +287,21 @@ class Pilot:
                     event["state"] = "idle"
                     continue
                 event.update(attempt_id=assignment["attempt_id"], job_id=assignment["job"]["job_id"])
-                event["worker"] = self._dispatch(host, assignment)
+                self._record_attempt(host, assignment, event)
+                event["worker"] = self._dispatch(host, assignment, event)
                 event["state"] = event["worker"]["state"]
             except (TransportError, CoordinatorError, SourceBundleError, OSError) as error:
                 event["error"] = _error(error)
-        return {"schema_version": 1, "hosts": events}
+        report = {"schema_version": 1, "hosts": events}
+        if self.analytics_error is not None:
+            report["analytics_errors"] = [self.analytics_error]
+        return report
 
     def result(self, job_id: str) -> dict:
         job = self.coordinator.status(job_id)
         report = {"schema_version": 1, "job": job, "worker": None}
+        if self.analytics_error is not None:
+            report["analytics_errors"] = [self.analytics_error]
         assignment = job["attempt"]
         if assignment is None:
             return report
@@ -219,7 +310,7 @@ class Pilot:
             raise ValidationError("assigned worker is absent from this pilot configuration")
         try:
             response = self.transports[host.host_id].request({"op": "status", "attempt_id": assignment["attempt_id"]})
-            report["worker"] = self._attempt_response(host, assignment, response)
+            report["worker"] = self._attempt_response(host, assignment, response, report)
             report["job"] = self.coordinator.status(job_id)
         except (TransportError, CoordinatorError, OSError) as error:
             report["error"] = _error(error)

@@ -8,6 +8,7 @@ import sys
 import time
 
 from . import Coordinator, CoordinatorError, ValidationError
+from .analytics import AnalyticsStore
 from .demo import run_demo
 from .source_bundle import SourceBundleError, package_source
 from .pilot import Pilot, load_config
@@ -97,6 +98,12 @@ def _parser() -> argparse.ArgumentParser:
             pilot_command.add_argument("--max-ticks", type=int, help="stop after this many ticks")
         elif command == "pilot-result":
             pilot_command.add_argument("--job-id", required=True)
+
+    pilot_report = commands.add_parser("pilot-report", help="summarize one local day's host observations and job usage")
+    pilot_report.add_argument("--config", required=True, help="pilot JSON configuration")
+    pilot_report.add_argument("--date", required=True, help="local calendar date (YYYY-MM-DD)")
+    pilot_report.add_argument("--timezone", default="UTC", help="IANA time zone (default: UTC)")
+    pilot_report.add_argument("--host", help="limit the report to one host ID")
     return parser
 
 
@@ -146,6 +153,10 @@ def main(argv: list[str] | None = None) -> int:
             value = run_demo()
         elif args.command == "bundle-source":
             value = package_source(args.repo, args.commit, args.output)
+        elif args.command == "pilot-report":
+            config = load_config(args.config)
+            with AnalyticsStore(config.analytics_path) as analytics:
+                value = analytics.report(args.date, args.timezone, args.host)
         elif args.command.startswith("pilot-"):
             with Pilot(load_config(args.config)) as pilot:
                 if args.command == "pilot-submit":

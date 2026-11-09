@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 from sparemesh import ConflictError, IdentityError, NotFoundError, ValidationError
 from sparemesh.worker import MAX_HEADER_BYTES, Worker, WorkerError, _extract
+from sparemesh.metrics import ProcessGroupUsage
 
 
 class WorkerTests(unittest.TestCase):
@@ -120,6 +121,79 @@ class WorkerTests(unittest.TestCase):
         self.config["profiles"]["smoke"]["runtime"] = "python3.1"
         self.write_config()
         self.assertFalse(Worker(self.config_path).probe()["snapshot"]["ready"])
+
+    def test_optional_owner_and_cached_analytics_observation(self):
+        self.config["owner"] = "alice"
+        self.write_config()
+        worker = Worker(self.config_path)
+        first = worker.probe()
+        second = Worker(self.config_path).probe()
+        self.assertEqual(first["analytics"]["sample"], second["analytics"]["sample"])
+        self.assertEqual(first["analytics"]["sample"]["host_id"], "host")
+        self.assertIsNone(first["analytics"]["sample"]["cpu_percent"])
+        self.assertEqual(first["analytics"]["diagnostics"], [])
+        self.assertEqual(worker.config["owner"], "alice")
+
+    def test_analytics_failures_do_not_change_probe_or_execution(self):
+        with patch.object(self.worker.sampler, "sample", side_effect=OSError("sample failed")), \
+                patch("sparemesh.analytics.AnalyticsStore", side_effect=OSError("store failed")):
+            response = self.worker.probe()
+            self.assertTrue(response["snapshot"]["ready"])
+            self.assertIsNone(response["analytics"]["sample"])
+            self.assertEqual(len(response["analytics"]["diagnostics"]), 2)
+            self.start()
+            self.assertEqual(self.wait()["state"], "succeeded")
+
+    def test_usage_checkpoint_failure_is_best_effort(self):
+        usage = ProcessGroupUsage(123)
+        with patch.object(self.worker, "_load", return_value={"usage": {}}), \
+                patch.object(self.worker, "_save", side_effect=OSError("checkpoint failed")):
+            self.worker._flush_usage("attempt-one", usage)
+        self.assertIn("checkpoint unavailable", usage.diagnostics[0])
+
+    def test_process_group_usage_and_real_wall_timestamps(self):
+        code = ("import os,time\n"
+                "if os.fork() == 0:\n"
+                " data = bytearray(8_000_000)\n"
+                " stop = time.monotonic() + 1.4\n"
+                " while time.monotonic() < stop: pass\n"
+                " os._exit(0)\n"
+                "os.wait()\n")
+        self.start(code)
+        response = self.wait()
+        self.assertEqual(response["state"], "succeeded")
+        usage = response["usage"]
+        self.assertGreater(usage["started_at"], self.assignment()["assigned_at"])
+        self.assertGreater(usage["finished_at"] - usage["started_at"], 1.0)
+        self.assertGreaterEqual(usage["usage_sample_count"], 1)
+        self.assertGreater(usage["cpu_seconds"], 0.2)
+        self.assertGreater(usage["peak_rss_mb"], 0)
+        self.assertEqual(response["analytics"]["attempt"]["cpu_seconds"], usage["cpu_seconds"])
+
+    def test_legacy_attempt_usage_remains_unknown(self):
+        self.start()
+        self.wait()
+        with self.worker._lock():
+            state = self.worker._load("attempt-one")
+            del state["usage"]
+            self.worker._save(state)
+        response = self.worker.status("attempt-one")
+        self.assertNotIn("usage", response)
+        self.assertIsNone(response["analytics"]["attempt"]["cpu_seconds"])
+        self.assertIsNone(response["analytics"]["attempt"]["started_at"])
+
+    def test_bounded_collect_and_local_report_commands(self):
+        command = [sys.executable, "-m", "sparemesh.worker", "--config", str(self.config_path)]
+        collect = subprocess.run(command + ["collect", "--interval", "0.05", "--max-samples", "2"],
+                                 capture_output=True, timeout=5)
+        self.assertEqual(collect.returncode, 0, collect.stdout + collect.stderr)
+        observations = [json.loads(line) for line in collect.stdout.splitlines()]
+        self.assertEqual(len(observations), 2)
+        self.assertNotEqual(observations[0]["sample"]["sample_id"], observations[1]["sample"]["sample_id"])
+        report = subprocess.run(command + ["report", "--date", "2026-11-09", "--timezone", "Asia/Makassar"],
+                                capture_output=True, timeout=5)
+        self.assertEqual(report.returncode, 0, report.stdout + report.stderr)
+        self.assertIsInstance(json.loads(report.stdout), dict)
 
     def test_memory_probe_failure_and_headroom_fail_closed(self):
         with patch.object(self.worker, "_memory", side_effect=WorkerError("probe failed")):
