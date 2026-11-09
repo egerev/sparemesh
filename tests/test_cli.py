@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -70,6 +71,39 @@ class CliTests(unittest.TestCase):
         output = self.cli("report-host", "mac", "--worker", "worker-mac", "--snapshot", "-", input=[])
         self.assertEqual(output.returncode, 2)
         self.assertEqual(json.loads(output.stderr)["error"]["code"], "ValidationError")
+
+    def test_source_bundle_cli_from_another_working_directory(self):
+        repo = Path(self.directory.name) / "repo with spaces"
+        repo.mkdir()
+        for arguments in [("init", "-q"), ("config", "user.name", "Bundle Test"),
+                          ("config", "user.email", "bundle@example.invalid")]:
+            subprocess.run(["git", "-C", str(repo), *arguments], check=True, capture_output=True)
+        (repo / "source.txt").write_text("fixed commit\n")
+        subprocess.run(["git", "-C", str(repo), "add", "."], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "fixture"], check=True, capture_output=True)
+        commit = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+        environment = dict(os.environ, PYTHONPATH=str(ROOT))
+        output = subprocess.run(
+            [sys.executable, "-m", "sparemesh", "--db", self.database, "bundle-source",
+             "--repo", "repo with spaces", "--commit", commit, "--output", "bundle"],
+            cwd=self.directory.name, env=environment, capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(output.returncode, 0, output.stderr)
+        manifest = json.loads(output.stdout)
+        self.assertEqual(manifest["commit"], commit)
+        self.assertEqual(manifest["schema_version"], 1)
+        self.assertTrue((Path(self.directory.name) / "bundle" / "source.tar").is_file())
+        self.assertFalse(Path(self.database).exists())
+
+    def test_source_bundle_errors_are_json(self):
+        output = self.cli("bundle-source", "--repo", str(ROOT), "--commit", "HEAD",
+                          "--output", str(Path(self.directory.name) / "bundle"))
+        self.assertEqual(output.returncode, 2)
+        self.assertEqual(output.stdout, "")
+        error = json.loads(output.stderr)["error"]
+        self.assertEqual(error["code"], "SourceBundleError")
+        self.assertIn("full", error["message"])
+        self.assertFalse(Path(self.database).exists())
 
 
 if __name__ == "__main__":
